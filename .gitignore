@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.spec.bak
+.venv/
+venv/
+.env
+*.egg
+.idea/
+.vscode/
+*.swp
