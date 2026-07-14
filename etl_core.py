@@ -1,31 +1,62 @@
 import pandas as pd
 
+SIIGO_HEADER_MARKERS = [
+    "Código cuentas contables",
+    "Comprobante",
+    "Fecha elaboración",
+    "Identificación tercero",
+]
 
 CONTAI_COLUMNS = [
     "Cuenta",
     "Comprobante",
     "Fecha(mm/dd/yyyy)",
-    "Docum",
+    "Documento",
     "Documento Ref.",
     "NIT",
     "Detalle",
+    "Detalle.1",
+    "Nombre del tercero",
+    "Débito",
+    "Crédito",
     "Tipo",
-    "Valor",
     "Base",
-    "Plazo",
+    "Centro de Costo",
 ]
 
 
-def _split_documento(serie: pd.Series) -> pd.DataFrame:
-    parts = serie.astype(str).str.split("-", expand=True)
-    return pd.DataFrame({
-        "Comprobante": parts[1] if 1 in parts.columns else "",
-        "Docum": parts[2] if 2 in parts.columns else "",
-    })
+def parsear_comprobante(valor: str) -> tuple[str, str, str]:
+    parts = str(valor).split("-")
+    if len(parts) != 3:
+        raise ValueError(f"Formato inesperado: '{valor}' (se esperan 3 partes separadas por '-')")
+    return parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+
+def _detectar_header(df_raw: pd.DataFrame) -> int:
+    for i, row in df_raw.iterrows():
+        valores = [str(v).strip() for v in row.values]
+        coincidencias = sum(1 for m in SIIGO_HEADER_MARKERS if m in valores)
+        if coincidencias >= 3:
+            return i
+    raise ValueError(
+        "No se encontró la fila de encabezados. "
+        f"Se buscaron al menos 3 de: {SIIGO_HEADER_MARKERS}"
+    )
+
+
+def _leer_siigo(ruta: str) -> pd.DataFrame:
+    df_raw = pd.read_excel(ruta, header=None)
+    header_row = _detectar_header(df_raw)
+
+    df = pd.read_excel(ruta, header=header_row)
+    df = df.dropna(how="all")
+    df = df[df["Código cuentas contables"].notna()]
+    df = df.reset_index(drop=True)
+    return df
 
 
 def _format_fecha(serie: pd.Series) -> pd.Series:
-    return pd.to_datetime(serie, dayfirst=True).dt.strftime("%m/%d/%Y")
+    return pd.to_datetime(serie).dt.strftime("%m/%d/%Y")
 
 
 def _clean_nit(serie: pd.Series) -> pd.Series:
@@ -36,32 +67,63 @@ def transformar_siigo_contai(
     ruta_entrada: str, ruta_salida: str
 ) -> tuple[bool, str]:
     try:
-        df = pd.read_excel(ruta_entrada)
+        df = _leer_siigo(ruta_entrada)
+    except ValueError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, f"Error al abrir el archivo: {e}"
 
-        doc_parts = _split_documento(df["Documento"])
+    filas_ok = []
+    advertencias = []
 
-        result = pd.DataFrame({
-            "Cuenta": df["Cuenta"],
-            "Comprobante": doc_parts["Comprobante"],
-            "Fecha(mm/dd/yyyy)": _format_fecha(df["Fecha"]),
-            "Docum": doc_parts["Docum"],
-            "Documento Ref.": df.get("Documento Ref.", ""),
-            "NIT": _clean_nit(df["Nit"]),
-            "Detalle": df["Detalle"],
-            "Tipo": df["Tipo"],
-            "Valor": df["Valor"],
-            "Base": df.get("Base", 0),
-            "Plazo": df.get("Plazo", 0),
+    for i, row in df.iterrows():
+        try:
+            docum, comprobante, doc_ref = parsear_comprobante(row["Comprobante"])
+        except ValueError as e:
+            advertencias.append(f"Fila {i + 1}: {e}")
+            continue
+
+        debito = pd.to_numeric(row.get("Débito", 0), errors="coerce")
+        credito = pd.to_numeric(row.get("Crédito", 0), errors="coerce")
+        debito = 0 if pd.isna(debito) else debito
+        credito = 0 if pd.isna(credito) else credito
+
+        if debito == 0 and credito == 0:
+            advertencias.append(f"Fila {i + 1}: Débito y Crédito ambos vacíos o cero")
+            continue
+
+        if debito != 0 and credito != 0:
+            advertencias.append(f"Fila {i + 1}: Débito y Crédito ambos con valor")
+            continue
+
+        filas_ok.append({
+            "Cuenta": row["Código cuentas contables"],
+            "Comprobante": comprobante,
+            "Fecha(mm/dd/yyyy)": pd.to_datetime(row["Fecha elaboración"]).strftime("%m/%d/%Y"),
+            "Documento": docum,
+            "Documento Ref.": doc_ref,
+            "NIT": str(int(float(row["Identificación tercero"]))).replace(" ", ""),
+            "Detalle": row.get("Descripción", ""),
+            "Detalle.1": row.get("Descripción", ""),
+            "Nombre del tercero": row.get("Nombre cuenta contable", ""),
+            "Débito": int(debito),
+            "Crédito": int(credito),
+            "Tipo": "",
+            "Base": 0,
+            "Centro de Costo": "",
         })
 
-        result = result[CONTAI_COLUMNS]
-        result.to_csv(ruta_salida, sep="\t", index=False)
+    if not filas_ok:
+        msg = "No se procesaron filas válidas."
+        if advertencias:
+            msg += "\n" + "\n".join(advertencias)
+        return False, msg
 
-        return True, f"{len(result)} registros exportados a {ruta_salida}"
+    result = pd.DataFrame(filas_ok)[CONTAI_COLUMNS]
+    result.to_csv(ruta_salida, sep="\t", index=False)
 
-    except KeyError as e:
-        return False, f"Columna requerida no encontrada en el archivo: {e}"
-    except ValueError as e:
-        return False, f"Error en formato de datos: {e}"
-    except Exception as e:
-        return False, f"Error inesperado: {e}"
+    msg = f"{len(filas_ok)} registros exportados."
+    if advertencias:
+        msg += f" {len(advertencias)} filas omitidas:\n" + "\n".join(advertencias)
+
+    return True, msg
