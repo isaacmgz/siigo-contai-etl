@@ -78,7 +78,7 @@ class App(ctk.CTk):
             return
 
         nombre = os.path.splitext(os.path.basename(entrada))[0]
-        salida = os.path.join(salida_dir, f"{nombre}_contai.txt")
+        salida = os.path.join(salida_dir, f"{nombre}_contai.xlsx")
 
         self._append_log(f"Procesando: {entrada}")
         ok, msg = transformar_siigo_contai(entrada, salida)
